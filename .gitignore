@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pq
+*.png
+.DS_Store
+del/
+md/
+.claude/

@@ -1,0 +1,9 @@
+requests
+pandas
+pyarrow
+matplotlib
+squarify
+PyJWT
+cryptography
+python-dotenv
+boto3
