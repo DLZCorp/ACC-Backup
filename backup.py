@@ -11,7 +11,7 @@ Usage:
     python backup.py --dry-run                            # sweep + dry-run
     python backup.py --preview                            # sweep + 16 KB preview
     python backup.py --skip-sweep                         # reuse existing copylist.pq
-    python backup.py --bucket my-bucket                   # override S3_BUCKET
+    python backup.py --dest mount_path                    # override SMB location
 """
 
 import argparse, re, subprocess, sys, pathlib
@@ -51,11 +51,11 @@ def parse_hub_name(sweep_output):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Back up a hub to S3")
+    parser = argparse.ArgumentParser(description="Back up a hub to SMB")
     parser.add_argument("--hub", default=DEFAULT_HUB,
                         help="Hub name or ID (default: %(default)s)")
-    parser.add_argument("--bucket", default="",
-                        help="Destination S3 bucket (default: S3_BUCKET from .env)")
+    parser.add_argument("--dest", default="",
+                        help="Destination SMB Share (default: SMB_SHARE from .env)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be uploaded, no downloads/uploads")
     parser.add_argument("--preview", action="store_true",
@@ -66,7 +66,7 @@ def main():
 
     # ── Future: Cleanup pass ─────────────────────────────────────────────
     # TODO: Read cache/removals.pq here (produced by webhook_listener.py),
-    # delete stale S3 prefixes, remove entries from cache.pq, then
+    # delete stale SMB paths, remove entries from cache.pq, then
     # truncate removals.pq.  See README "Future Work" section.
 
     # ── Phase 1: Sweep ───────────────────────────────────────────────────
@@ -84,10 +84,10 @@ def main():
         hub_name = parse_hub_name(sweep_output)
 
     # ── Phase 2: Copy to S3 ──────────────────────────────────────────────
-    copy_cmd = [sys.executable, str(HERE / "copy_to_s3.py"),
+    copy_cmd = [sys.executable, str(HERE / "copy_to_smb.py"),
                 "--prefix", hub_name]
     if args.bucket:
-        copy_cmd += ["--bucket", args.bucket]
+        copy_cmd += ["--dest", args.dest]
     if args.dry_run:
         copy_cmd.append("--dry-run")
     if args.preview:
