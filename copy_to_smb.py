@@ -59,8 +59,7 @@ def batch_signed_download_urls(token: str, bucket_key: str, object_keys: list[st
         url,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json=body,
-        timeout=60,
-        verify=False
+        timeout=60
     )
     if not r.ok:
         print(f"  !! OSS batch signed URL {r.status_code}: {r.text[:300]}")
