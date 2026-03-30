@@ -14,17 +14,32 @@ Usage:
     python backup.py --dest mount_path                    # override SMB location
 """
 
-import argparse, re, subprocess, sys, pathlib
+import argparse, re, subprocess, sys, pathlib, ssl, base64, os
+
+bundlePath = r'\\bh-pan1\Files\Restricted\IT\Projects\Add Zscaler Cert\certs\Zscaler.pem'
+
+ctx = ssl.create_default_context()
+certs = ctx.get_ca_certs(binary_form=True)
+
+
+# Write them all to a PEM bundle
+out = pathlib.Path(bundlePath)
+with out.open('wb') as f:
+    for cert in certs:
+        f.write(b'-----BEGIN CERTIFICATE-----\n')
+        f.write(base64.encodebytes(cert))
+        f.write(b'-----END CERTIFICATE-----\n')
+
+os.environ['REQUESTS_CA_BUNDLE'] = bundlePath
 
 HERE = pathlib.Path(__file__).parent
-DEFAULT_HUB = "Developer Advocacy Support"
-
+DEFAULT_HUB = "DLZ Corporation"
 
 def run(cmd):
     """Run a command, streaming output live. Returns stdout as a string."""
-    print(f"\n{'─'*60}")
+    print(f"\n{'─' * 60}")
     print(f"▶ {' '.join(cmd)}")
-    print(f"{'─'*60}")
+    print(f"{'─' * 60}")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, cwd=HERE)
     lines = []
@@ -86,7 +101,7 @@ def main():
     # ── Phase 2: Copy to S3 ──────────────────────────────────────────────
     copy_cmd = [sys.executable, str(HERE / "copy_to_smb.py"),
                 "--prefix", hub_name]
-    if args.bucket:
+    if args.dest:
         copy_cmd += ["--dest", args.dest]
     if args.dry_run:
         copy_cmd.append("--dry-run")
