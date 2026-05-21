@@ -13,7 +13,7 @@ Usage:
     python sweep.py --hub b.abc123                      # by ID
 """
 
-import argparse, pathlib, requests
+import argparse, pathlib, sys, requests
 from datetime import datetime, timezone
 from auth import load_token
 import pandas as pd
@@ -23,7 +23,6 @@ HERE = pathlib.Path(__file__).parent
 CACHE_FILE = HERE / "cache" / "cache.pq"
 COPYLIST_FILE = HERE / "cache" / "copylist.pq"
 
-TOKEN = load_token()
 NOW = datetime.now(timezone.utc).isoformat()
 
 # ── Stats ────────────────────────────────────────────────────────────────────
@@ -31,10 +30,73 @@ stats = {"projects_screened": 0, "projects_dirty": 0,
          "folders_walked": 0, "api_calls": 0, "files_found": 0}
 
 
-def dm_get(path):
+class ProjectProgress:
+    """Live progress line for the current project being walked.
+
+    Renders one line that updates in place via carriage return. Call
+    start() when beginning a project, tick() whenever folder/file counts
+    change, and finish() when the project is done (advances to a new line).
+    """
+
+    def __init__(self) -> None:
+        self.project_name = ""
+        self.project_idx = 0
+        self.project_total = 0
+        self.folders = 0
+        self.files = 0
+        self._last_line_len = 0
+        self._enabled = sys.stdout.isatty()
+
+    def start(self, project_name: str, idx: int, total: int) -> None:
+        self.project_name = project_name
+        self.project_idx = idx
+        self.project_total = total
+        self.folders = 0
+        self.files = 0
+        if not self._enabled:
+            # Pipe / log: just print a single start line
+            print(f"  Walking [{idx}/{total}] {project_name}...")
+            return
+        self._render()
+
+    def tick(self, folders_delta: int = 0, files_delta: int = 0) -> None:
+        if not self._enabled:
+            return
+        self.folders += folders_delta
+        self.files += files_delta
+        self._render()
+
+    def finish(self) -> None:
+        if not self._enabled:
+            print(f"    done: folders={self.folders}, files={self.files}")
+            return
+        # Finalize with newline so the next project starts cleanly
+        self._render()
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    def _render(self) -> None:
+        line = (f"  Walking [{self.project_idx}/{self.project_total}] "
+                f"{self.project_name}  (folders={self.folders}, "
+                f"files={self.files})")
+        # Pad to overwrite any longer previous line
+        pad = max(0, self._last_line_len - len(line))
+        sys.stdout.write("\r" + line + (" " * pad))
+        sys.stdout.flush()
+        self._last_line_len = len(line)
+
+
+progress = ProjectProgress()
+
+
+def dm_get(path: str) -> dict:
+    """Make an authenticated GET request, refreshing the token if needed."""
     stats["api_calls"] += 1
-    r = requests.get(f"{DM_BASE}{path}",
-                     headers={"Authorization": f"Bearer {TOKEN}"}, timeout=30)
+    r = requests.get(
+        f"{DM_BASE}{path}",
+        headers={"Authorization": f"Bearer {load_token()}"},
+        timeout=30,
+    )
     if not r.ok:
         print(f"  !! DM HTTP {r.status_code}: {r.text[:200]}")
     r.raise_for_status()
@@ -43,7 +105,7 @@ def dm_get(path):
 
 # ── Load cache ───────────────────────────────────────────────────────────────
 
-def load_cache():
+def load_cache() -> pd.DataFrame:
     if CACHE_FILE.exists():
         return pd.read_parquet(CACHE_FILE)
     return pd.DataFrame(columns=[
@@ -52,7 +114,7 @@ def load_cache():
     ])
 
 
-def cache_lookup(cache_df, folder_id):
+def cache_lookup(cache_df: pd.DataFrame, folder_id: str) -> str | None:
     """Return cached rollup for a folder_id, or None."""
     rows = cache_df.loc[cache_df["folder_id"] == folder_id, "lastModifiedTimeRollup"]
     if len(rows) > 0:
@@ -62,7 +124,7 @@ def cache_lookup(cache_df, folder_id):
 
 # ── Hub / project discovery ──────────────────────────────────────────────────
 
-def find_hub(hub_filter):
+def find_hub(hub_filter: str) -> tuple[str, str]:
     """Find hub by name or ID. Returns (hub_id, hub_name)."""
     hubs = dm_get("/project/v1/hubs")["data"]
     for h in hubs:
@@ -80,7 +142,7 @@ def find_hub(hub_filter):
     raise SystemExit(1)
 
 
-def list_projects(hub_id):
+def list_projects(hub_id: str) -> list:
     """Return all projects in a hub (handles pagination)."""
     resp = dm_get(f"/project/v1/hubs/{hub_id}/projects")
     projects = resp.get("data", [])
@@ -92,7 +154,7 @@ def list_projects(hub_id):
 
 # ── Phase 0: Screen projects ────────────────────────────────────────────────
 
-def screen_projects(hub_id, projects, cache_df):
+def screen_projects(hub_id: str, projects: list, cache_df: pd.DataFrame) -> list:
     """Return list of (project_id, project_name, root_folder_id, root_rollup)
     for projects whose root rollup changed vs cache."""
     dirty = []
@@ -132,11 +194,12 @@ def screen_projects(hub_id, projects, cache_df):
 
 # ── Phase 1+2: Walk dirty branches + build copylist ─────────────────────────
 
-def walk_folder(hub_id, project_id, project_name, folder_id, path,
-                cache_df, folder_rows, file_rows, max_depth=10, depth=0):
+def walk_folder(hub_id: str, project_id: str, project_name: str,
+                folder_id: str, path: str, cache_df: pd.DataFrame,
+                folder_rows: list, file_rows: list,
+                max_depth: int = 10, depth: int = 0) -> None:
     """Recursively walk folder tree. Collect folder state + changed files."""
 
-    # Get subfolders
     contents_url = (f"/data/v1/projects/{project_id}/folders/{folder_id}"
                     f"/contents?filter[type]=folders&page[limit]=200")
     try:
@@ -145,7 +208,6 @@ def walk_folder(hub_id, project_id, project_name, folder_id, path,
         print(f"    ERR walking {path}: {e}")
         return
 
-    has_dirty_subfolder = False
     for item in contents.get("data", []):
         if item["type"] != "folders":
             continue
@@ -157,8 +219,8 @@ def walk_folder(hub_id, project_id, project_name, folder_id, path,
         obj_count = a.get("objectCount", 0) or 0
 
         stats["folders_walked"] += 1
+        progress.tick(folders_delta=1)
 
-        # Record folder state for cache
         folder_rows.append({
             "hub_id": hub_id,
             "project_id": project_id,
@@ -175,19 +237,54 @@ def walk_folder(hub_id, project_id, project_name, folder_id, path,
         if rollup and rollup == cached_rollup:
             continue  # prune — unchanged branch
 
-        has_dirty_subfolder = True
-
-        # Recurse into dirty subfolder
         if depth < max_depth:
             walk_folder(hub_id, project_id, project_name, fid, sub_path,
                         cache_df, folder_rows, file_rows, max_depth, depth + 1)
 
-    # If this folder is dirty (we were called because parent was dirty),
-    # fetch file items to build the copylist
     fetch_files(hub_id, project_id, project_name, folder_id, path, file_rows)
 
 
-def fetch_files(hub_id, project_id, project_name, folder_id, path, file_rows):
+def _append_file_row(rows: list, hub_id: str, project_id: str, project_name: str,
+                     folder_id: str, path: str, item: dict, included: dict) -> None:
+    """Extract file metadata from a DM item and append to rows."""
+    a = item["attributes"]
+    file_name = a.get("displayName", a.get("name", "?"))
+    tip_id = (item.get("relationships", {})
+              .get("tip", {}).get("data", {}).get("id"))
+    storage_urn = ""
+    size_bytes = 0
+    version_number = 0
+    if tip_id and tip_id in included:
+        tip = included[tip_id]
+        storage_data = (tip.get("relationships", {})
+                        .get("storage", {}).get("data", {}))
+        storage_urn = storage_data.get("id", "")
+        size_bytes = tip.get("attributes", {}).get("storageSize", 0) or 0
+        version_number = tip.get("attributes", {}).get("versionNumber", 0) or 0
+
+    rows.append({
+        "hub_id": hub_id,
+        "project_id": project_id,
+        "project_name": project_name,
+        "folder_id": folder_id,
+        "path": f"{path}/{file_name}",
+        "item_id": item["id"],
+        "file_name": file_name,
+        "storage_urn": storage_urn,
+        "size_bytes": size_bytes,
+        "tip_version_id": tip_id or "",
+        "version_number": version_number,
+        "hidden": a.get("hidden", False),
+        "reserved": a.get("reserved", False),
+        "lastModifiedTime": a.get("lastModifiedTime", ""),
+        "detected_at": NOW,
+    })
+    stats["files_found"] += 1
+    progress.tick(files_delta=1)
+
+
+def fetch_files(hub_id: str, project_id: str, project_name: str,
+                folder_id: str, path: str, file_rows: list) -> None:
     """Fetch file items from a folder and extract storage URNs."""
     items_url = (f"/data/v1/projects/{project_id}/folders/{folder_id}"
                  f"/contents?filter[type]=items&page[limit]=200")
@@ -197,49 +294,12 @@ def fetch_files(hub_id, project_id, project_name, folder_id, path, file_rows):
         print(f"    ERR fetching files {path}: {e}")
         return
 
-    # Build lookup of included storage objects
-    included = {}
-    for inc in resp.get("included", []):
-        included[inc["id"]] = inc
+    included = {inc["id"]: inc for inc in resp.get("included", [])}
 
     for item in resp.get("data", []):
-        if item["type"] != "items":
-            continue
-        a = item["attributes"]
-        file_name = a.get("displayName", a.get("name", "?"))
-
-        # Get tip version storage from included
-        tip_id = (item.get("relationships", {})
-                  .get("tip", {}).get("data", {}).get("id"))
-        storage_urn = ""
-        size_bytes = 0
-        version_number = 0
-        if tip_id and tip_id in included:
-            tip = included[tip_id]
-            storage_data = (tip.get("relationships", {})
-                           .get("storage", {}).get("data", {}))
-            storage_urn = storage_data.get("id", "")
-            size_bytes = tip.get("attributes", {}).get("storageSize", 0) or 0
-            version_number = tip.get("attributes", {}).get("versionNumber", 0) or 0
-
-        file_rows.append({
-            "hub_id": hub_id,
-            "project_id": project_id,
-            "project_name": project_name,
-            "folder_id": folder_id,
-            "path": f"{path}/{file_name}",
-            "item_id": item["id"],
-            "file_name": file_name,
-            "storage_urn": storage_urn,
-            "size_bytes": size_bytes,
-            "tip_version_id": tip_id or "",
-            "version_number": version_number,
-            "hidden": a.get("hidden", False),
-            "reserved": a.get("reserved", False),
-            "lastModifiedTime": a.get("lastModifiedTime", ""),
-            "detected_at": NOW,
-        })
-        stats["files_found"] += 1
+        if item["type"] == "items":
+            _append_file_row(file_rows, hub_id, project_id, project_name,
+                             folder_id, path, item, included)
 
     # Handle pagination
     while resp.get("links", {}).get("next", {}).get("href"):
@@ -247,87 +307,51 @@ def fetch_files(hub_id, project_id, project_name, folder_id, path, file_rows):
         for inc in resp.get("included", []):
             included[inc["id"]] = inc
         for item in resp.get("data", []):
-            if item["type"] != "items":
-                continue
-            a = item["attributes"]
-            file_name = a.get("displayName", a.get("name", "?"))
-            tip_id = (item.get("relationships", {})
-                      .get("tip", {}).get("data", {}).get("id"))
-            storage_urn = ""
-            size_bytes = 0
-            version_number = 0
-            if tip_id and tip_id in included:
-                tip = included[tip_id]
-                storage_data = (tip.get("relationships", {})
-                                .get("storage", {}).get("data", {}))
-                storage_urn = storage_data.get("id", "")
-                size_bytes = tip.get("attributes", {}).get("storageSize", 0) or 0
-                version_number = tip.get("attributes", {}).get("versionNumber", 0) or 0
-            file_rows.append({
-                "hub_id": hub_id,
-                "project_id": project_id,
-                "project_name": project_name,
-                "folder_id": folder_id,
-                "path": f"{path}/{file_name}",
-                "item_id": item["id"],
-                "file_name": file_name,
-                "storage_urn": storage_urn,
-                "size_bytes": size_bytes,
-                "tip_version_id": tip_id or "",
-                "version_number": version_number,
-                "hidden": a.get("hidden", False),
-                "reserved": a.get("reserved", False),
-                "lastModifiedTime": a.get("lastModifiedTime", ""),
-                "detected_at": NOW,
-            })
-            stats["files_found"] += 1
+            if item["type"] == "items":
+                _append_file_row(file_rows, hub_id, project_id, project_name,
+                                 folder_id, path, item, included)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Hub folder sweep → cache.pq + copylist.pq")
     parser.add_argument("--hub", default="Developer Advocacy Support",
                         help="Hub name or ID (default: Developer Advocacy Support)")
     args = parser.parse_args()
 
-    # Find hub
     print(f"Finding hub '{args.hub}'...")
     hub_id, hub_name = find_hub(args.hub)
     print(f"  Hub: {hub_name} ({hub_id})")
 
-    # Load cache
     cache_df = load_cache()
     print(f"  Cache: {len(cache_df)} folder rows loaded")
 
-    # List projects
     print(f"\nListing projects...")
     projects = list_projects(hub_id)
     print(f"  Found {len(projects)} projects")
 
-    # Phase 0: Screen
     print(f"\nPhase 0: Screening projects...")
     dirty = screen_projects(hub_id, projects, cache_df)
     if not dirty:
         print("\nAll projects clean. Nothing to do.")
-        # Still write empty copylist
         pd.DataFrame(columns=[
             "hub_id", "project_id", "project_name", "folder_id", "path",
             "item_id", "file_name", "storage_urn", "size_bytes",
             "tip_version_id", "version_number",
             "hidden", "reserved", "lastModifiedTime", "detected_at",
+            "status",
         ]).to_parquet(COPYLIST_FILE)
         print(f"  Wrote empty {COPYLIST_FILE.name}")
         return
 
-    # Phase 1+2: Walk dirty projects
-    folder_rows = []
-    file_rows = []
+    folder_rows: list = []
+    file_rows: list = []
 
-    for pid, pname, root_fid, root_rollup in dirty:
-        print(f"\nWalking: {pname}...")
+    total_dirty = len(dirty)
+    for idx, (pid, pname, root_fid, root_rollup) in enumerate(dirty, start=1):
+        progress.start(pname, idx, total_dirty)
 
-        # Record root folder in cache
         folder_rows.append({
             "hub_id": hub_id,
             "project_id": pid,
@@ -340,18 +364,16 @@ def main():
             "scanned_at": NOW,
         })
 
-        # Walk tree (walk_folder fetches files at each level including root)
         walk_folder(hub_id, pid, pname, root_fid, "Project Files",
                     cache_df, folder_rows, file_rows)
 
-    # Phase 3: Persist
+        progress.finish()
+
     print(f"\nPhase 3: Persisting...")
 
-    # Merge cache: keep unchanged rows, replace scanned folders
     new_cache = pd.DataFrame(folder_rows)
     if not cache_df.empty:
         scanned_fids = set(new_cache["folder_id"])
-        # Keep old rows for folders we didn't re-scan (clean projects)
         kept = cache_df[~cache_df["folder_id"].isin(scanned_fids)]
         merged = pd.concat([kept, new_cache], ignore_index=True)
     else:
@@ -361,10 +383,10 @@ def main():
     print(f"  cache.pq: {len(merged)} folder rows")
 
     copylist = pd.DataFrame(file_rows)
+    copylist["status"] = "pending"
     copylist.to_parquet(COPYLIST_FILE)
     print(f"  copylist.pq: {len(copylist)} file rows")
 
-    # Summary
     print(f"\n{'='*60}")
     print(f"SWEEP SUMMARY")
     print(f"{'='*60}")
