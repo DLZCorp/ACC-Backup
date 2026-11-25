@@ -361,6 +361,45 @@ python copy_to_s3.py --prefix "Hub Name" --bucket b  # prepend hub name to S3 ke
 
 ---
 
+## Failure Alerts
+
+`backup.py` raises a Jira ticket when a run goes wrong, and `check_staleness.py` raises one when no run has completed recently. Both post JSON to a Jira Automation rule with an **Incoming webhook** trigger; the rule creates the ticket.
+
+| Alert `kind` | Raised by | Meaning |
+|--------------|-----------|---------|
+| `failure` | `backup.py` | A phase exited non-zero or an unexpected exception occurred. Nothing was stamped. |
+| `stale` | `check_staleness.py` | No completed run within `--max-age-hours` (default 26). |
+
+A run that completes is a success even if individual files failed to download: those are recorded in `cache/failures.pq`, retried on the next run, and do not raise a ticket. The counts are printed at the end of the run and stored in `cache/last_run.json`.
+
+The request is `POST <JIRA_ALERT_WEBHOOK_URL>` with header `X-Automation-Webhook-Token: <JIRA_ALERT_WEBHOOK_TOKEN>` and this body:
+
+```json
+{
+  "source": "acc-backup",
+  "kind": "failure",
+  "summary": "ACC backup failed: sweep.py exited with code 1",
+  "details": "Command: ...\n\nLast output:\n...",
+  "host": "server-name",
+  "timestamp": "2026-01-01T02:00:00+00:00"
+}
+```
+
+### Jira rule
+
+1. In the Jira project, create an automation rule with the **Incoming webhook** trigger, set so the rule runs without work items supplied in the request. Copy the URL and secret into `.env`.
+2. Add a **Lookup work items** action: `project = <KEY> AND labels = acc-backup-alert AND statusCategory != Done`.
+3. If the lookup returns nothing, **Create work item** with summary `{{webhookData.summary}}`, description built from `{{webhookData.details}}`, `{{webhookData.host}}` and `{{webhookData.timestamp}}`, and label `acc-backup-alert`.
+4. Otherwise, **Comment** on the found work item with the same fields, so a backup that fails every night keeps one ticket open instead of opening one per night.
+
+Test it with the rule's audit log open: run `python check_staleness.py --max-age-hours 0`, which always reports stale.
+
+### Scheduling the staleness check
+
+Run `check_staleness.py` daily as its own scheduled task, a few hours after the backup normally finishes. It exits 0 when fresh, 1 when stale and alerted, 2 when stale and the alert could not be sent. Because it runs on the same machine as the backup, it does not cover that machine being down.
+
+---
+
 ## Why Webhooks Aren't Needed
 
 For a **daily backup cycle**, polling with the rollup trick is simpler and sufficient:

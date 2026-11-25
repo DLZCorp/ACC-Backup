@@ -16,6 +16,7 @@ Usage:
 import argparse, pathlib, sys, requests
 from datetime import datetime, timezone
 from auth import load_token
+from console import use_utf8_stdout
 import pandas as pd
 
 DM_BASE = "https://developer.api.autodesk.com"
@@ -315,6 +316,10 @@ def fetch_files(hub_id: str, project_id: str, project_name: str,
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # Project and folder names are printed verbatim and can contain characters
+    # the Windows ANSI code page cannot encode when stdout is a pipe or file.
+    use_utf8_stdout()
+
     parser = argparse.ArgumentParser(description="Hub folder sweep → cache.pq + copylist.pq")
     parser.add_argument("--hub", default="Developer Advocacy Support",
                         help="Hub name or ID (default: Developer Advocacy Support)")

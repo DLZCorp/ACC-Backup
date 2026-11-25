@@ -1,0 +1,11 @@
+# Tooling configuration only; runtime dependencies stay in requirements.txt.
+
+[tool.pytest.ini_options]
+# Collect from tests/ only. The scripts in examples/ call the Autodesk API at
+# import time and one of them matches pytest's *_test.py naming pattern.
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+extend-exclude = ["from server"]
